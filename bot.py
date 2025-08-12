@@ -1,6 +1,7 @@
 # Telegram Auto-Reaction Bot with Forced Subscription (v20+ compatible)
 # Professional version with robust error handling and structure.
 
+from keep_alive import keep_alive
 import logging
 import random
 import asyncio
@@ -281,4 +282,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    keep_alive()
     main()
+
