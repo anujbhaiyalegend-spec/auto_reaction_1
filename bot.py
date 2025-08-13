@@ -25,8 +25,8 @@ BOT_TOKEN = "8133117251:AAH2pr-gQ2bjr4EYxKhdk_tcPlqQxAaXF9Y"
 MAIN_CHANNEL_USERNAME = "Unix_Bots"  # The @username of your mandatory channel.
 
 # --- Reaction Emoji Lists ---
-POSITIVE_REACTIONS = ["👍", "❤️", "🔥", "🎉", "👏", "🤩", "💯"]
-FALLBACK_REACTIONS = ["👌", "😁", "🤔", "👀", "🤔"]
+POSITIVE_REACTIONS = ["👍", "❤️", "🔥", "🎉", "👏", "🤩", "💯", "🙏", "💘", "😘", "🤗", "🆒", "😇", "⚡", "🫡"]
+FALLBACK_REACTIONS = ["👌", "😁", "❤️‍🔥", "🥰", "💋"]
 
 # --- Logging Setup ---
 # Configure logging to provide detailed output for easier debugging.
@@ -284,4 +284,5 @@ def main() -> None:
 if __name__ == "__main__":
     keep_alive()
     main()
+
 
