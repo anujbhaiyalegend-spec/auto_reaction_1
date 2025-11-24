@@ -1,288 +1,470 @@
-# Telegram Auto-Reaction Bot with Forced Subscription (v20+ compatible)
-# Professional version with robust error handling and structure.
-
 from keep_alive import keep_alive
+import os
 import logging
-import random
+import datetime
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import threading
+import io
+import random
+from typing import Dict, Any
+
+from flask import Flask
+from pymongo import MongoClient
+import certifi  # Fix for SSL errors
+
+# python-telegram-bot v20+ imports
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+)
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    filters,
-    ContextTypes,
-    ChatMemberHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
+    ContextTypes,
+    filters,
 )
-from telegram.constants import ChatType
-from telegram.error import BadRequest, TelegramError, Forbidden
+from telegram.helpers import escape_markdown
 
-# --- Configuration ---
-# IMPORTANT: For production, it's highly recommended to use environment variables
-# or a secure configuration management system instead of hardcoding tokens.
-BOT_TOKEN = "8133117251:AAH2pr-gQ2bjr4EYxKhdk_tcPlqQxAaXF9Y"
-MAIN_CHANNEL_USERNAME = "Unix_Bots"  # The @username of your mandatory channel.
+# --- CONFIGURATION ---
+# 1. Telegram Settings
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8133117251:AAH2pr-gQ2bjr4EYxKhdk_tcPlqQxAaXF9Y")
+MAIN_CHANNEL_USERNAME = os.environ.get("MAIN_CHANNEL_USERNAME", "Unix_Bots")
+raw_admins = os.environ.get("ADMIN_IDS", "7191595289,7258860451")
+ADMIN_IDS = [int(x) for x in raw_admins.split(",") if x.strip()]
 
-# --- Reaction Emoji Lists ---
+# 2. MongoDB Settings
+DB_USER = "thehider09_db_user"
+DB_PASS = "WHTUO1kQJj834fsV"
+DB_CLUSTER = "cluster0.cwfxlzq.mongodb.net"
+DB_NAME = "telegram_bot_db"
+MONGO_URI = f"mongodb+srv://{DB_USER}:{DB_PASS}@{DB_CLUSTER}/?retryWrites=true&w=majority"
+
+# 3. Reactions
 POSITIVE_REACTIONS = ["👍", "❤️", "🔥", "🎉", "👏", "🤩", "💯", "🙏", "💘", "😘", "🤗", "🆒", "😇", "⚡", "🫡"]
 FALLBACK_REACTIONS = ["👌", "😁", "❤️‍🔥", "🥰", "💋"]
 
-# --- Logging Setup ---
-# Configure logging to provide detailed output for easier debugging.
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-# Set a higher log level for the httpx library to avoid spamming the console.
-logging.getLogger("httpx").setLevel(logging.WARNING)
+# --- LOGGING ---
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- In-memory Storage ---
-# A simple dictionary to store notifications for users who haven't started the bot.
-# For a more scalable solution, consider using a database like SQLite or Redis.
-pending_notifications = {}
+# --- MONGODB CONNECTION ---
+try:
+    # UPDATED: Added tlsAllowInvalidCertificates=True to bypass Windows SSL issues
+    mongo_client = MongoClient(
+        MONGO_URI, 
+        tlsCAFile=certifi.where(),
+        tlsAllowInvalidCertificates=True 
+    )
+    
+    # Send a ping to confirm a successful connection
+    mongo_client.admin.command('ping')
+    
+    db = mongo_client[DB_NAME]
+    users_col = db['users']
+    chats_col = db['chats']
+    pending_col = db['pending_notifications']
+    logger.info("✅ Connected to MongoDB Successfully")
+except Exception as e:
+    logger.critical(f"❌ Failed to connect to MongoDB: {e}")
+    # We exit because the bot cannot function without the DB
+    exit(1)
 
+# --- FLASK KEEP-ALIVE SERVER (FOR RENDER) ---
+app = Flask(__name__)
 
-# --- Helper Functions ---
-async def is_user_member_of_channel(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    """
-    Checks if a user is a member of the main channel.
-    Returns True if the user is a member, False otherwise.
-    """
+@app.route('/')
+def home():
+    return "Bot is running with MongoDB storage!", 200
+
+def run_flask_app():
+    port = int(os.environ.get("PORT", 5000))
+    # Disable flask logging to keep console clean
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    app.run(host='0.0.0.0', port=port)
+
+# --- DATABASE HELPER FUNCTIONS ---
+
+def track_user(user, update_last_seen: bool = False) -> None:
+    """Upsert user data into MongoDB."""
+    if not user:
+        return
+    
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    
+    update_fields = {
+        "username": user.username,
+        "first_name": user.first_name,
+        "is_bot": user.is_bot
+    }
+    
+    if update_last_seen:
+        update_fields["last_seen"] = now_iso
+
     try:
-        member = await context.bot.get_chat_member(
-            chat_id=f"@{MAIN_CHANNEL_USERNAME}",
-            user_id=user_id
+        users_col.update_one(
+            {"_id": user.id},
+            {
+                "$set": update_fields,
+                "$setOnInsert": {"last_seen": now_iso, "joined_at": now_iso}
+            },
+            upsert=True
         )
-        # A user is considered a member if their status is creator, administrator, or member.
-        return member.status in ["member", "administrator", "creator"]
-    except BadRequest as e:
-        # This can happen if the user ID is invalid or the chat is not found.
-        logger.warning(f"BadRequest checking membership for user {user_id} in @{MAIN_CHANNEL_USERNAME}: {e}")
-        return False
-    except TelegramError as e:
-        # Catch other potential Telegram API errors.
-        logger.error(f"TelegramError checking membership for user {user_id}: {e}")
+    except Exception as e:
+        logger.error(f"DB Error tracking user: {e}")
+
+def track_chat(chat_id: int, title: str, chat_type: str, adder_user_id: int) -> None:
+    """Upsert chat data into MongoDB."""
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        chats_col.update_one(
+            {"_id": chat_id},
+            {
+                "$set": {
+                    "title": title,
+                    "type": chat_type,
+                    "adder_id": adder_user_id,
+                    "last_active": now_iso
+                },
+                "$setOnInsert": {"added_at": now_iso}
+            },
+            upsert=True
+        )
+    except Exception as e:
+        logger.error(f"DB Error tracking chat: {e}")
+
+def add_pending_notification(user_id: int, message: str):
+    try:
+        pending_col.update_one(
+            {"_id": user_id},
+            {"$push": {"messages": message}},
+            upsert=True
+        )
+    except Exception as e:
+        logger.error(f"DB Error adding notification: {e}")
+
+def get_and_clear_pending_notifications(user_id: int):
+    try:
+        doc = pending_col.find_one_and_delete({"_id": user_id})
+        return doc.get("messages", []) if doc else []
+    except Exception:
+        return []
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+# --- BOT COMMANDS & LOGIC ---
+
+DEFAULT_COMMANDS = [BotCommand("start", "👋 Start the bot & check subscription")]
+ADMIN_COMMANDS = [BotCommand("start", "👋 Start the bot & check subscription"),
+                  BotCommand("admin", "👑 Access admin panel (Admin only)"),
+                  BotCommand("cancel_broadcast", "🛑 Cancel ongoing broadcast"),
+                  BotCommand("export_data", "📁 Export stored JSON")]
+
+async def post_init_commands(application: Application) -> None:
+    await application.bot.set_my_commands(DEFAULT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    for admin_id in ADMIN_IDS:
+        try:
+            await application.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception:
+            pass
+    logger.info("Bot commands configured.")
+
+async def is_user_member_of_channel(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id=f"@{MAIN_CHANNEL_USERNAME}", user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        logger.warning("Membership check failed for %s: %s", user_id, e)
         return False
 
+# --- HANDLERS ---
 
-# --- Core Bot Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the /start command in private chats and delivers pending notifications."""
     if not update.message or update.message.chat.type != ChatType.PRIVATE:
         return
 
     user = update.effective_user
-    user_id = user.id
-    
-    # Deliver any pending notifications now that the user has started the bot.
-    if user_id in pending_notifications:
-        logger.info(f"Delivering {len(pending_notifications[user_id])} pending notification(s) to user {user_id}.")
-        for notification in pending_notifications[user_id]:
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=notification,
-                    disable_web_page_preview=True
-                )
-            except (Forbidden, BadRequest) as e:
-                logger.warning(f"Could not send pending notification to {user_id}: {e}")
-            except Exception as e:
-                logger.error(f"Unexpected error sending pending notification to {user_id}: {e}")
-        # Clear notifications after attempting delivery.
-        del pending_notifications[user_id]
+    track_user(user, update_last_seen=True)
 
-    # Check membership and show the appropriate welcome message.
-    if await is_user_member_of_channel(context, user_id):
-        bot_username = (await context.bot.get_me()).username
-        group_url = f"https://t.me/{bot_username}?startgroup=true"
-        channel_url = f"https://t.me/{bot_username}?startchannel=true"
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("➕ Add to Group ➕", url=group_url),
-                InlineKeyboardButton("📢 Add to Channel 📢", url=channel_url)
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            "🌟 **Welcome!**\n\nYou are a member of our main channel and can now use the bot.\n\n"
-            "Add me to a group or channel using the buttons below:",
-            reply_markup=reply_markup,
+    msgs = get_and_clear_pending_notifications(user.id)
+    for txt in msgs:
+        try:
+            await context.bot.send_message(chat_id=user.id, text=txt, disable_web_page_preview=True)
+        except Exception:
+            pass
+
+    bot_username = (await context.bot.get_me()).username
+    is_member = await is_user_member_of_channel(context, user.id)
+
+    if is_member:
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("➕ Add to Group ➕", url=f"https://t.me/{bot_username}?startgroup=true"),
+            InlineKeyboardButton("📢 Add to Channel 📢", url=f"https://t.me/{bot_username}?startchannel=true"),
+        ]])
+        text = (
+            "🌟 *Welcome!*\n\n"
+            "You are a member of our main channel and can now use the bot.\n\n"
+            "Add me to a group or channel using the buttons below:"
         )
     else:
-        keyboard = [
+        keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"1. Join @{MAIN_CHANNEL_USERNAME}", url=f"https://t.me/{MAIN_CHANNEL_USERNAME}")],
             [InlineKeyboardButton("2. I Have Joined ✅", callback_data="check_join")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            "🔒 **Access Required**\n\nTo use this bot, you must first join our main channel.\n\n"
-            "Please join the channel and then click 'I Have Joined ✅'.",
-            reply_markup=reply_markup,
+        ])
+        text = (
+            "🔒 *Access Required*\n\n"
+            "To use this bot, you must first join our main channel.\n\n"
+            "Please join the channel and then click 'I Have Joined ✅'."
         )
 
+    try:
+        await update.message.reply_text(escape_markdown(text, version=2), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
+    except Exception:
+        await update.message.reply_text(text.replace("*", ""), reply_markup=keyboard)
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles all inline button presses, primarily for checking channel join status."""
+async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
+    user = query.from_user
+    track_user(user, update_last_seen=True)
 
-    if query.data == "check_join":
-        if await is_user_member_of_channel(context, user_id):
-            bot_username = (await context.bot.get_me()).username
-            group_url = f"https://t.me/{bot_username}?startgroup=true"
-            channel_url = f"https://t.me/{bot_username}?startchannel=true"
-            
-            keyboard = [
-                [
-                    InlineKeyboardButton("➕ Add to Group ➕", url=group_url),
-                    InlineKeyboardButton("📢 Add to Channel 📢", url=channel_url)
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(
-                text="✅ **Thank you for joining!**\nYou can now add me to a group or channel:",
-                reply_markup=reply_markup
-            )
-        else:
-            await query.answer("❌ You haven't joined the channel yet. Please join and try again.", show_alert=True)
-
+    if await is_user_member_of_channel(context, user.id):
+        bot_username = (await context.bot.get_me()).username
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("➕ Add to Group ➕", url=f"https://t.me/{bot_username}?startgroup=true"),
+            InlineKeyboardButton("📢 Add to Channel 📢", url=f"https://t.me/{bot_username}?startchannel=true"),
+        ]])
+        text = "✅ *Thank you for joining!*\nYou can now add me to a group or channel:"
+        try:
+            await query.edit_message_text(escape_markdown(text, version=2), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
+        except:
+            await query.edit_message_text(text.replace("*", ""), reply_markup=keyboard)
+    else:
+        await query.answer("❌ You haven't joined the channel yet. Please join and try again.", show_alert=True)
 
 async def handle_chat_addition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    A unified handler for when the bot is added to a group or channel.
-    It identifies who added the bot and sends them a private confirmation message.
-    """
     if not update.my_chat_member:
         return
-
     chat_member = update.my_chat_member
     chat = chat_member.chat
-    adder_user = chat_member.from_user
+    adder = chat_member.from_user
     new_status = chat_member.new_chat_member.status
     old_status = chat_member.old_chat_member.status
+    
+    was_added = new_status in ("member", "administrator") and old_status not in ("member", "administrator")
+    
+    if was_added and adder:
+        chat_title = chat.title or (f"Channel ID: {chat.id}" if chat.type == ChatType.CHANNEL else "Private Group")
+        chat_type_str = "Group" if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) else "Channel"
 
-    # Determine if the bot was just added.
-    was_added = new_status in ["member", "administrator"] and old_status not in ["member", "administrator"]
-    if not was_added or not adder_user:
-        return
+        track_chat(chat.id, chat_title, chat_type_str, adder.id)
 
-    chat_title = chat.title or "this chat"
-    private_msg = ""
+        private_msg = None
+        if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            private_msg = f"✅ Thanks for adding me to the group '{chat_title}'! I will react to new messages automatically."
+        elif chat.type == ChatType.CHANNEL and new_status == "administrator":
+            private_msg = f"📢 Thanks for adding me to the channel '{chat_title}'! Please ensure I have 'Add Reactions' permission."
 
-    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        logger.info(f"Bot was added to group '{chat_title}' ({chat.id}) by {adder_user.id}.")
-        private_msg = (
-            f"✅ Thanks for adding me to the group **'{chat_title}'**!\n\n"
-            "I'll automatically react to new messages there. My bro 😎"
-        )
-    elif chat.type == ChatType.CHANNEL and new_status == "administrator":
-        logger.info(f"Bot was added to channel '{chat_title}' ({chat.id}) by {adder_user.id}.")
-        private_msg = (
-            f"📢 Thanks for adding me to the channel **'{chat_title}'**!\n\n"
-            "I'll automatically react to new posts there. For best results, "
-            "please ensure I have 'Add Reactions' permission."
-        )
-
-    if not private_msg:
-        return
-
-    # Try to send the confirmation message directly to the user who added the bot.
-    try:
-        await context.bot.send_message(chat_id=adder_user.id, text=private_msg)
-        logger.info(f"Sent confirmation to user {adder_user.id} for chat '{chat_title}'.")
-    except (Forbidden, BadRequest):
-        logger.warning(f"Couldn't message user {adder_user.id} (hasn't started bot). Storing pending notification.")
-        if adder_user.id not in pending_notifications:
-            pending_notifications[adder_user.id] = []
-        pending_notifications[adder_user.id].append(private_msg)
-    except Exception as e:
-        logger.error(f"Unexpected error sending confirmation to {adder_user.id}: {e}")
-
+        if private_msg:
+            try:
+                await context.bot.send_message(chat_id=adder.id, text=private_msg)
+            except Exception:
+                add_pending_notification(adder.id, private_msg)
 
 async def react_to_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reacts to a new post in a channel or group."""
     message = update.channel_post or update.message
-    if not message or (message.text and message.text.startswith('/')) or message.via_bot:
+    if not message:
+        return
+    if (message.text and message.text.startswith("/")) or message.via_bot or message.new_chat_members or message.left_chat_member:
         return
 
-    # Skip status updates like new members joining.
-    if message.new_chat_members or message.left_chat_member:
-        return
+    if message.from_user:
+        track_user(message.from_user, update_last_seen=True)
 
-    chat_id = message.chat_id
-    message_id = message.message_id
-    logger.info(f"New message {message_id} in chat {chat_id}. Attempting to react.")
-
-    # Combine all reactions and try a few random ones to increase success rate.
     all_reactions = POSITIVE_REACTIONS + FALLBACK_REACTIONS
+    chosen_emojis = random.sample(all_reactions, min(len(all_reactions), 3))
     
-    for emoji in random.sample(all_reactions, min(len(all_reactions), 3)):
+    for emoji in chosen_emojis:
         try:
             await context.bot.set_message_reaction(
-                chat_id=chat_id,
-                message_id=message_id,
-                reaction=[emoji],
+                chat_id=message.chat.id, 
+                message_id=message.message_id, 
+                reaction=[emoji], 
                 is_big=False
             )
-            logger.info(f"Successfully reacted with '{emoji}' in chat {chat_id}.")
-            return  # Exit after the first successful reaction.
-        except TelegramError as e:
-            logger.warning(f"Could not react with '{emoji}' in chat {chat_id}: {e}")
-            await asyncio.sleep(0.3)  # Small delay before retrying.
-        except Exception as e:
-            logger.error(f"An unexpected error occurred while trying to react in {chat_id}: {e}")
-            break # Stop trying if a non-Telegram error occurs.
+            return
+        except Exception:
+            continue
 
-    logger.error(f"Failed to react to message {message_id} in chat {chat_id} after all attempts.")
+# --- ADMIN PANEL ---
 
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    A global error handler to log all uncaught exceptions.
-    This prevents the bot from crashing and provides valuable debug information.
-    """
-    logger.error("Exception while handling an update:", exc_info=context.error)
-
-
-def main() -> None:
-    """Sets up the bot, registers handlers, and starts polling for updates."""
-    if not BOT_TOKEN or "YOUR_BOT_TOKEN" in BOT_TOKEN:
-        logger.critical("!!! BOT TOKEN IS MISSING OR INVALID !!!")
-        logger.critical("Please set your bot token in the configuration section.")
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    source = update.message or (update.callback_query and update.callback_query.message)
+    
+    if not user or not is_admin(user.id):
+        if source: await source.reply_text("❌ Access denied.")
         return
 
-    # Create the Application and pass it your bot's token.
-    application = Application.builder().token(BOT_TOKEN).build()
+    try:
+        total_users = users_col.count_documents({})
+        total_chats = chats_col.count_documents({})
+    except Exception:
+        total_users = "Err"
+        total_chats = "Err"
 
-    # --- Register Handlers ---
-    # Global error handler (most important for stability).
-    application.add_error_handler(error_handler)
+    text = (
+        f"👑 Admin Panel\n\n"
+        f"👥 Total Users: `{total_users}`\n"
+        f"📢 Total Chats/Channels: `{total_chats}`\n\n"
+        "Select an action below:"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📨 Broadcast Message", callback_data="admin_broadcast_start")],
+        [InlineKeyboardButton("📊 View User List", callback_data="admin_view_users")],
+        [InlineKeyboardButton("🏢 View Chat List", callback_data="admin_view_chats")],
+        [InlineKeyboardButton("📁 Export Data", callback_data="admin_export_data")],
+    ])
+    await source.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
 
-    # Command to start the bot in a private chat.
-    application.add_handler(CommandHandler("start", start_command, filters.ChatType.PRIVATE))
+async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return await query.edit_message_text("❌ Access expired.")
+
+    data = query.data
+    if data == "admin_broadcast_start":
+        context.user_data["broadcast_mode"] = True
+        await query.edit_message_text("📡 Broadcast mode activated.\nSend the message you want to broadcast now (or /cancel_broadcast).", 
+                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]]))
+    elif data == "admin_view_users":
+        await show_list(query.message.chat_id, context, "users")
+    elif data == "admin_view_chats":
+        await show_list(query.message.chat_id, context, "chats")
+    elif data == "admin_export_data":
+        await export_data_to_admin(query.message.chat_id, context)
+    elif data == "admin_back":
+        await admin_command(update, context)
+
+async def show_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE, type_str: str) -> None:
+    try:
+        if type_str == "users":
+            cursor = users_col.find().sort("last_seen", -1).limit(20)
+            lines = []
+            for u in cursor:
+                uname = f"@{u.get('username')}" if u.get('username') else "No User"
+                lines.append(f"👤 {u.get('first_name', '?')} ({uname})\nID: `{u['_id']}` | Seen: `{u.get('last_seen', '?')[:16]}`")
+            title = "User Details (Top 20 Active)"
+        else:
+            cursor = chats_col.find().sort("last_active", -1).limit(20)
+            lines = []
+            for c in cursor:
+                lines.append(f"{c.get('title', '?')} ({c.get('type', '?')})\nID: `{c['_id']}`")
+            title = "Chats (Top 20 Active)"
+    except Exception as e:
+        logger.error(f"DB Error fetching list: {e}")
+        await context.bot.send_message(chat_id=chat_id, text="❌ Database error.")
+        return
     
-    # Handles the "I have joined" button press.
-    application.add_handler(CallbackQueryHandler(button_callback, pattern="^check_join$"))
+    text = f"📊 {title}\n\n" + "\n---\n".join(lines)
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN,
+                                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]]))
+
+async def admin_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id) or not context.user_data.get("broadcast_mode"):
+        return
+    context.user_data.pop("broadcast_mode", None)
     
-    # Handles when the bot's status changes in a chat (added/removed/promoted).
+    try:
+        cursor = users_col.find({}, {"_id": 1})
+        user_ids = [doc["_id"] for doc in cursor]
+    except Exception:
+        await update.message.reply_text("❌ Database error.")
+        return
+    
+    if not user_ids:
+        await update.message.reply_text("⚠️ No users found.")
+        return
+
+    await update.message.reply_text(f"🚀 Starting broadcast to {len(user_ids)} users...")
+    sent = 0
+    failed = 0
+    for target in user_ids:
+        try:
+            await context.bot.copy_message(chat_id=target, from_chat_id=update.message.chat_id, message_id=update.message.message_id)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    await update.message.reply_text(f"✅ Broadcast finished.\nSent: {sent}\nFailed: {failed}")
+
+async def cancel_broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id): return
+    context.user_data.pop("broadcast_mode", None)
+    await update.message.reply_text("🛑 Broadcast cancelled.")
+
+async def export_data_to_admin(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        users = list(users_col.find())
+        chats = list(chats_col.find())
+        data = {"users": users, "chats": chats}
+        
+        import json
+        def default(o):
+            if isinstance(o, (datetime.date, datetime.datetime)):
+                return o.isoformat()
+            return str(o)
+
+        bio = io.BytesIO()
+        bio.write(json.dumps(data, default=default, ensure_ascii=False, indent=2).encode("utf-8"))
+        bio.seek(0)
+        await context.bot.send_document(chat_id=chat_id, document=bio, filename="mongodb_dump.json")
+    except Exception:
+        await context.bot.send_message(chat_id=chat_id, text="❌ Export failed.")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update: %s", context.error)
+
+def main() -> None:
+    if not BOT_TOKEN:
+        logger.critical("BOT_TOKEN is not set.")
+        return
+
+    logger.info("🚀 Starting Flask Server for Render...")
+    t = threading.Thread(target=run_flask_app)
+    t.daemon = True
+    t.start()
+
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init_commands).build()
+
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("cancel_broadcast", cancel_broadcast_command))
+    application.add_handler(CommandHandler("export_data", lambda u, c: export_data_to_admin(u.effective_user.id, c)))
+
+    application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^admin_"))
+    application.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
     application.add_handler(ChatMemberHandler(handle_chat_addition, ChatMemberHandler.MY_CHAT_MEMBER))
     
-    # Handles reacting to any message that isn't a command.
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, react_to_post))
+    application.add_handler(MessageHandler(filters.User(ADMIN_IDS) & ~filters.COMMAND, admin_broadcast_message))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.User(ADMIN_IDS), react_to_post))
+    
+    application.add_error_handler(error_handler)
 
-    # --- Start the Bot ---
-    logger.info("Starting bot...")
-    # run_polling() is a blocking call that will keep the bot running.
-    # It also handles graceful shutdowns on signals like Ctrl+C.
+    logger.info("🚀 Starting Bot Polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     keep_alive()
     main()
-
-
